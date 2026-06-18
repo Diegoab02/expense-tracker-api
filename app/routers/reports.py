@@ -8,113 +8,130 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
 from app.models.expense import Expense, Budget, Category
-from app.schemas.expense import MonthlyReport, CategorySummary, AlertLevel
-from app.services.alert_service import (
-    calculate_spent_in_month,
-    check_all_budget_alerts,
-    get_alert_level,
+from app.schemas.expense import (
+    MonthlyReport, CategorySummaryFront, ReportSummary,
+    BudgetAlert, AlertLevel, ExpenseItem
 )
+from app.services.alert_service import calculate_spent_in_month, get_alert_level
 
 router = APIRouter(prefix="/reports", tags=["Reportes"])
 
 
+def alert_level_to_status(level: AlertLevel) -> str:
+    """Convierte el nivel de alerta al texto que espera el front."""
+    if level == AlertLevel.EXCEEDED:
+        return "CRÍTICO"
+    elif level == AlertLevel.WARNING:
+        return "ADVERTENCIA"
+    return "OK"
+
+
 @router.get("/monthly", response_model=MonthlyReport)
 def monthly_report(
-    month: int = Query(default=None, ge=1, le=12, description="Mes (1-12)"),
-    year: int = Query(default=None, description="Año"),
+    month: int = Query(default=None, ge=1, le=12),
+    year: int = Query(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Reporte mensual completo.
-    
-    Por defecto usa el mes y año actual.
-    
-    Incluye:
-    - Total gastado vs total presupuestado
-    - Desglose por categoría con % de uso
-    - Todas las alertas activas (categorías al 80%+)
+    Reporte mensual en el formato exacto que espera el frontend.
     """
     now = datetime.now(timezone.utc)
     month = month or now.month
     year = year or now.year
 
-    # Obtener todas las categorías del usuario
-    categories = db.query(Category).filter(
-        Category.owner_id == current_user.id
-    ).all()
+    categories = db.query(Category).filter(Category.owner_id == current_user.id).all()
 
-    # Obtener todos los presupuestos del mes
+    # Mapa de presupuestos del mes
     budgets_map = {}
-    budgets = db.query(Budget).filter(
+    for b in db.query(Budget).filter(
         Budget.owner_id == current_user.id,
         Budget.month == month,
         Budget.year == year,
-    ).all()
-    for b in budgets:
+    ).all():
         budgets_map[b.category_id] = b
 
-    # Calcular resumen por categoría
     category_summaries = []
     total_spent = 0.0
-    total_budgeted = 0.0
+    total_budget = 0.0
 
     for cat in categories:
         spent = calculate_spent_in_month(db, current_user.id, cat.id, month, year)
-
-        # Solo incluir categorías con gastos o presupuesto en este mes
         budget = budgets_map.get(cat.id)
+
         if spent == 0 and not budget:
             continue
 
+        budget_amount = budget.amount if budget else 0.0
         total_spent += spent
+        total_budget += budget_amount
 
-        budget_amount = None
-        percentage = None
-        alert_level = None
+        percentage = round((spent / budget_amount) * 100, 2) if budget_amount > 0 else 0.0
+        alert_level = get_alert_level(percentage)
+        status = alert_level_to_status(alert_level)
+        remaining = max(budget_amount - spent, 0)
 
-        if budget:
-            budget_amount = budget.amount
-            total_budgeted += budget_amount
-            percentage = round((spent / budget_amount) * 100, 2) if budget_amount > 0 else 0
-            alert_level = get_alert_level(percentage)
-
-        # Contar número de gastos en la categoría este mes
-        expense_count = db.query(func.count(Expense.id)).filter(
+        # Obtener gastos de esta categoría en el mes
+        expenses_raw = db.query(Expense).filter(
             Expense.owner_id == current_user.id,
             Expense.category_id == cat.id,
             extract("month", Expense.expense_date) == month,
             extract("year", Expense.expense_date) == year,
-        ).scalar() or 0
+        ).order_by(Expense.expense_date.desc()).all()
 
-        category_summaries.append(CategorySummary(
+        expenses = [
+            ExpenseItem(
+                id=e.id,
+                description=e.description,
+                amount=e.amount,
+                date=e.expense_date,
+                category=cat.name,
+            )
+            for e in expenses_raw
+        ]
+
+        category_summaries.append(CategorySummaryFront(
+            category=cat.name,
             category_id=cat.id,
-            category_name=cat.name,
             category_color=cat.color,
-            total_spent=spent,
-            budget_amount=budget_amount,
-            percentage_used=percentage,
-            alert_level=alert_level,
-            expense_count=expense_count,
+            budget=budget_amount,
+            spent=round(spent, 2),
+            remaining=round(remaining, 2),
+            percentage=percentage,
+            status=status,
+            expense_count=len(expenses),
+            expenses=expenses,
         ))
 
-    # Ordenar por gasto descendente
-    category_summaries.sort(key=lambda x: x.total_spent, reverse=True)
+    category_summaries.sort(key=lambda x: x.spent, reverse=True)
 
-    # Calcular porcentaje global
-    overall_percentage = round(
-        (total_spent / total_budgeted) * 100, 2
-    ) if total_budgeted > 0 else 0.0
+    overall_percentage = round((total_spent / total_budget) * 100, 2) if total_budget > 0 else 0.0
+    total_remaining = max(total_budget - total_spent, 0)
 
-    # Obtener todas las alertas activas
-    alerts = check_all_budget_alerts(db, current_user.id, month, year)
+    # Alertas — categorías al 80%+
+    alerts = []
+    for cat_summary in category_summaries:
+        if cat_summary.status in ("ADVERTENCIA", "CRÍTICO"):
+            level = AlertLevel.EXCEEDED if cat_summary.status == "CRÍTICO" else AlertLevel.WARNING
+            alerts.append(BudgetAlert(
+                category_id=cat_summary.category_id,
+                category_name=cat_summary.category,
+                budget_amount=cat_summary.budget,
+                spent_amount=cat_summary.spent,
+                percentage_used=cat_summary.percentage,
+                alert_level=level,
+                message=f"{'🚨' if level == AlertLevel.EXCEEDED else '⚠️'} {cat_summary.category}: {cat_summary.percentage}% del presupuesto usado.",
+            ))
 
     return MonthlyReport(
         month=month,
         year=year,
-        total_spent=round(total_spent, 2),
-        total_budgeted=round(total_budgeted, 2),
-        overall_percentage=overall_percentage,
+        summary=ReportSummary(
+            total_budget=round(total_budget, 2),
+            total_spent=round(total_spent, 2),
+            total_remaining=round(total_remaining, 2),
+            overall_percentage=overall_percentage,
+        ),
         categories=category_summaries,
         alerts=alerts,
     )

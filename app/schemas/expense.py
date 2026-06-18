@@ -58,7 +58,7 @@ class BudgetResponse(BaseModel):
     month: int
     year: int
     category_id: int
-    category: CategoryResponse
+    category: str        # nombre de la categoría (lo que el front espera)
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -67,13 +67,12 @@ class BudgetResponse(BaseModel):
 # ─── Alert ───────────────────────────────────────────────────────────────────
 
 class AlertLevel(str, Enum):
-    OK = "ok"                     # < 80%
-    WARNING = "warning"           # 80% - 99%
-    EXCEEDED = "exceeded"         # 100%+
+    OK = "ok"
+    WARNING = "warning"
+    EXCEEDED = "exceeded"
 
 
 class BudgetAlert(BaseModel):
-    """Alerta generada cuando se registra un gasto."""
     category_id: int
     category_name: str
     budget_amount: float
@@ -89,7 +88,7 @@ class ExpenseCreate(BaseModel):
     amount: float
     description: Optional[str] = None
     category_id: int
-    expense_date: Optional[datetime] = None  # Si no se pasa, se usa now()
+    expense_date: Optional[datetime] = None
 
     @field_validator("amount")
     @classmethod
@@ -97,6 +96,17 @@ class ExpenseCreate(BaseModel):
         if v <= 0:
             raise ValueError("El monto debe ser mayor a 0")
         return v
+
+
+class ExpenseItem(BaseModel):
+    """Gasto en el formato que el front espera dentro del reporte."""
+    id: int
+    description: Optional[str]
+    amount: float
+    date: datetime      # el front usa 'date', no 'expense_date'
+    category: str       # nombre de la categoría
+
+    model_config = {"from_attributes": True}
 
 
 class ExpenseResponse(BaseModel):
@@ -112,29 +122,53 @@ class ExpenseResponse(BaseModel):
 
 
 class ExpenseWithAlerts(BaseModel):
-    """Respuesta al crear un gasto — incluye el gasto + alertas de presupuesto."""
     expense: ExpenseResponse
-    alerts: List[BudgetAlert]  # Lista vacía si no hay alertas
+    alerts: List[BudgetAlert]
+    # budget_status para compatibilidad con el front
+    budget_status: Optional[dict] = None
 
 
-# ─── Reports ──────────────────────────────────────────────────────────────────
+# ─── Reports — estructura exacta que espera el front ──────────────────────────
+
+class CategorySummaryFront(BaseModel):
+    """Resumen de categoría en el formato exacto del dashboard del front."""
+    category: str               # nombre (el front usa 'category', no 'category_name')
+    category_id: int
+    category_color: str
+    budget: float               # el front usa 'budget'
+    spent: float                # el front usa 'spent'
+    remaining: float            # el front usa 'remaining'
+    percentage: float           # el front usa 'percentage'
+    status: str                 # 'OK', 'ADVERTENCIA', 'CRÍTICO'
+    expense_count: int
+    expenses: List[ExpenseItem]  # el front necesita la lista de gastos por categoría
+
+
+class ReportSummary(BaseModel):
+    """Resumen global — el front accede como report.summary.xxx"""
+    total_budget: float
+    total_spent: float
+    total_remaining: float
+    overall_percentage: float
+
+
+class MonthlyReport(BaseModel):
+    """Reporte mensual en el formato exacto que espera el front."""
+    month: int
+    year: int
+    summary: ReportSummary      # el front usa report.summary.total_budget etc.
+    categories: List[CategorySummaryFront]
+    alerts: List[BudgetAlert]
+
+
+# ─── Schemas legacy (para endpoints no relacionados con reportes) ──────────────
 
 class CategorySummary(BaseModel):
     category_id: int
     category_name: str
     category_color: str
     total_spent: float
-    budget_amount: Optional[float]  # None si no tiene presupuesto definido
+    budget_amount: Optional[float]
     percentage_used: Optional[float]
     alert_level: Optional[AlertLevel]
     expense_count: int
-
-
-class MonthlyReport(BaseModel):
-    month: int
-    year: int
-    total_spent: float
-    total_budgeted: float
-    overall_percentage: float
-    categories: List[CategorySummary]
-    alerts: List[BudgetAlert]  # Categorías que están al 80%+ del presupuesto

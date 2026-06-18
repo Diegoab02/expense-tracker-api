@@ -7,44 +7,64 @@ from typing import List, Optional
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
-from app.models.expense import Expense, Category
+from app.models.expense import Expense, Category, Budget
 from app.schemas.expense import ExpenseCreate, ExpenseResponse, ExpenseWithAlerts
-from app.services.alert_service import check_budget_alerts
+from app.services.alert_service import check_budget_alerts, get_alert_level, calculate_spent_in_month
+from app.schemas.expense import AlertLevel
 
 router = APIRouter(prefix="/expenses", tags=["Gastos"])
 
 
 @router.post("/", response_model=ExpenseWithAlerts, status_code=status.HTTP_201_CREATED)
 def create_expense(
-    data: ExpenseCreate,
+    data: dict,  # usamos dict para aceptar tanto budget_id como category_id
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     Registra un nuevo gasto.
-    
-    Respuesta incluye el gasto + alertas de presupuesto:
-    - Si el gasto lleva la categoría al 80-99% → alerta WARNING
-    - Si supera el 100% → alerta EXCEEDED
-    - Si todo está bien → alerts: []
-    
-    Las alertas solo aparecen si tienes un presupuesto definido para esa categoría.
+    Acepta tanto 'category_id' (API directa) como 'budget_id' (desde el front).
     """
-    # Verificar que la categoría existe y pertenece al usuario
+    amount = data.get("amount")
+    description = data.get("description")
+    expense_date = data.get("expense_date")
+
+    # El front manda budget_id, la API directa manda category_id
+    budget_id = data.get("budget_id")
+    category_id = data.get("category_id")
+
+    if budget_id:
+        # Buscar la categoría a través del presupuesto
+        budget = db.query(Budget).filter(
+            Budget.id == budget_id,
+            Budget.owner_id == current_user.id,
+        ).first()
+        if not budget:
+            raise HTTPException(status_code=404, detail="Presupuesto no encontrado")
+        category_id = budget.category_id
+    
+    if not category_id:
+        raise HTTPException(status_code=422, detail="Se requiere category_id o budget_id")
+
     category = db.query(Category).filter(
-        Category.id == data.category_id,
+        Category.id == category_id,
         Category.owner_id == current_user.id,
     ).first()
     if not category:
         raise HTTPException(status_code=404, detail="Categoría no encontrada")
 
-    # Usar fecha del gasto o now() si no se especifica
-    expense_date = data.expense_date or datetime.now(timezone.utc)
+    if not amount or amount <= 0:
+        raise HTTPException(status_code=422, detail="El monto debe ser mayor a 0")
+
+    if expense_date and isinstance(expense_date, str):
+        expense_date = datetime.fromisoformat(expense_date.replace("Z", "+00:00"))
+
+    expense_date = expense_date or datetime.now(timezone.utc)
 
     expense = Expense(
-        amount=data.amount,
-        description=data.description,
-        category_id=data.category_id,
+        amount=amount,
+        description=description,
+        category_id=category_id,
         owner_id=current_user.id,
         expense_date=expense_date,
     )
@@ -52,19 +72,39 @@ def create_expense(
     db.commit()
     db.refresh(expense)
 
-    # Verificar alertas DESPUÉS de guardar el gasto
-    # (para que el nuevo gasto ya esté incluido en el cálculo)
+    # Verificar alertas
     alert = check_budget_alerts(
         db=db,
         user_id=current_user.id,
-        category_id=data.category_id,
+        category_id=category_id,
         month=expense_date.month,
         year=expense_date.year,
     )
 
+    # budget_status en el formato que espera el front
+    budget_status = None
+    if alert:
+        budget_status = {
+            "level": "CRÍTICO" if alert.alert_level == AlertLevel.EXCEEDED else "ADVERTENCIA",
+            "message": alert.message,
+            "percentage": alert.percentage_used,
+        }
+    else:
+        spent = calculate_spent_in_month(db, current_user.id, category_id, expense_date.month, expense_date.year)
+        budget_obj = db.query(Budget).filter(
+            Budget.owner_id == current_user.id,
+            Budget.category_id == category_id,
+            Budget.month == expense_date.month,
+            Budget.year == expense_date.year,
+        ).first()
+        if budget_obj:
+            pct = round((spent / budget_obj.amount) * 100, 2)
+            budget_status = {"level": "OK", "message": f"✅ {category.name}: {pct}% usado.", "percentage": pct}
+
     return ExpenseWithAlerts(
         expense=expense,
         alerts=[alert] if alert else [],
+        budget_status=budget_status,
     )
 
 
@@ -78,23 +118,13 @@ def list_expenses(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Lista gastos del usuario.
-    
-    Filtros opcionales:
-    - month, year: filtra por periodo
-    - category_id: filtra por categoría
-    - skip, limit: paginación
-    """
     query = db.query(Expense).filter(Expense.owner_id == current_user.id)
-
     if month:
         query = query.filter(extract("month", Expense.expense_date) == month)
     if year:
         query = query.filter(extract("year", Expense.expense_date) == year)
     if category_id:
         query = query.filter(Expense.category_id == category_id)
-
     return query.order_by(Expense.expense_date.desc()).offset(skip).limit(limit).all()
 
 
@@ -104,7 +134,6 @@ def get_expense(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Obtiene un gasto por ID."""
     expense = db.query(Expense).filter(
         Expense.id == expense_id,
         Expense.owner_id == current_user.id,
@@ -120,7 +149,6 @@ def delete_expense(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Elimina un gasto."""
     expense = db.query(Expense).filter(
         Expense.id == expense_id,
         Expense.owner_id == current_user.id,
